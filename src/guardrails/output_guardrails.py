@@ -28,7 +28,7 @@ from core.utils import chat_with_agent
 # ============================================================
 
 def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+    """Redact matching PII and credentials; safe refers to these checks only.
 
     Args:
         response: The LLM's response text
@@ -39,21 +39,35 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
+    # Detect on the original response so overlapping types are all reported.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "phone": r"(?<!\w)(?:0|\+84)(?:[ .-]?[0-9]){9,10}(?!\w)",
+        "email": r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?!\w)",
+        "national_id": r"(?<!\w)(?:[0-9]{12}|[0-9]{9})(?!\w)",
+        "api_key": r"\bsk-[a-z0-9]+(?:[-_][a-z0-9]+)*\b",
+        "password": (
+            r"\b(?:password|mật\s+khẩu|mat\s+khau)\s*"
+            r"(?:[:=]|\bis\b|\blà\b|\bla\b)\s*"
+            r'''(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s,;]+)'''
+        ),
     }
 
+    spans = []
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = list(re.finditer(pattern, response, re.IGNORECASE))
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            spans.extend(match.span() for match in matches)
+
+    # Merge overlaps before replacing, e.g. an API key used as a password.
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    for start, end in reversed(merged):
+        redacted = redacted[:start] + "[REDACTED]" + redacted[end:]
 
     return {
         "safe": len(issues) == 0,
@@ -89,15 +103,11 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-3.5-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
-
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = llm_agent.LlmAgent(
+    model="gemini-3.5-flash",
+    name="safety_judge",
+    instruction=SAFETY_JUDGE_INSTRUCTION,
+)
 judge_runner = None
 
 
@@ -172,16 +182,24 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filter_result = content_filter(response_text)
+        if filter_result["issues"]:
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part(text=filter_result["redacted"])],
+            )
+            self.redacted_count += 1
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            safety_result = await llm_safety_check(response_text)
+            if not safety_result["safe"]:
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part(text="I'm sorry, I can't provide that response. Please contact customer support for assistance.")],
+                )
+                self.blocked_count += 1
+
+        return llm_response
 
 
 # ============================================================

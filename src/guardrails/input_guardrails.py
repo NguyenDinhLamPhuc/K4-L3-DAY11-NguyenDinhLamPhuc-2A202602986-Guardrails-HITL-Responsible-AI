@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from typing import Literal
-
+import unicodedata
 from google.genai import types
 from google.adk.plugins import base_plugin
 from google.adk.agents.invocation_context import InvocationContext
@@ -51,14 +51,30 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+
+        # NFKC handles compatibility characters such as full-width letters.
+    normalized = unicodedata.normalize("NFKC", user_input)
+    # Check both interpretations: an invisible character may split a word
+    # (ig\u200bnore) or replace a space (Ignore\u200ball).
+    candidates = [
+        "".join(
+            replacement if unicodedata.category(char) == "Cf" else char
+            for char in normalized
+        )
+        for replacement in ("", " ")
+    ]
+
+    INJECTION_PATTERNS = [  
+        r"\bignore\s+(?:all\s+)?(?:(?:previous|above|prior)\s+)?instructions?\b",
+        r"\byou\s+are\s+now\b",
+        r"\bsystem\s+prompt\b",
+        r"\breveal\s+(?:(?:your|the)\s+)?(?:instructions?|prompt)\b",
+        r"\bpretend\s+(?:you\s+are|to\s+be)\b",
+        r"\bact\s+as\s+(?:(?:a|an)\s+)?unrestricted\b",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+         if any(re.search(pattern, text, re.IGNORECASE) for text in candidates):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +100,28 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    def normalize_topic(text: str) -> str:
+        # Match Vietnamese text against the unaccented topics in config.py.
+        text = unicodedata.normalize("NFKD", text.casefold()).replace("đ", "d")
+        text = "".join(
+            char for char in text
+            if not unicodedata.combining(char)
+            and unicodedata.category(char) != "Cf"
+        )
+        return " ".join(text.split())
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    normalized = normalize_topic(user_input)
 
-    pass  # Replace with your implementation
+    def matches_topic(topic: str) -> bool:
+        # Word boundaries avoid matching "kill" inside "skills", for example.
+        pattern = r"\b" + re.escape(normalize_topic(topic)) + r"\b"
+        return re.search(pattern, normalized) is not None
+
+    if any(matches_topic(topic) for topic in BLOCKED_TOPICS):
+        return "BLOCK"
+    if any(matches_topic(topic) for topic in ALLOWED_TOPICS):
+        return "ALLOW"
+    return "BLOCK"
 
 
 # ============================================================
@@ -144,14 +174,21 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Tôi không thể xử lý yêu cầu thay đổi hướng dẫn hoặc tiết lộ "
+                "thông tin nội bộ. Tôi có thể hỗ trợ câu hỏi ngân hàng VinBank."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Tôi chỉ hỗ trợ các câu hỏi ngân hàng hợp lệ về tài khoản, "
+                "giao dịch, tiết kiệm, khoản vay và thẻ tín dụng tại VinBank."
+            )
+
+        return None
 
 
 # ============================================================
